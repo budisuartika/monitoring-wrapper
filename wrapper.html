@@ -1,0 +1,222 @@
+<!-- ===== Wrapper Monitoring for Blogger (paste in HTML mode of Page/Post) ===== -->
+<!doctype html>
+<html lang="id">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width,initial-scale=1" />
+<title>Ujian Terawasi — Wrapper</title>
+<style>
+  :root{--bg:#0b1220;--card:#0f1720;--accent:#2ea043}
+  body{margin:0;font-family:system-ui,Segoe UI,Arial;background:var(--bg);color:#fff}
+  .login {max-width:420px;margin:48px auto;padding:18px;background:var(--card);border-radius:10px}
+  input, button{width:100%;padding:10px;margin-top:10px;border-radius:6px;border:0}
+  button{background:var(--accent);color:#fff;font-weight:700;cursor:pointer}
+  #frameWrap{display:none;height:100vh}
+  iframe{width:100%;height:100vh;border:0}
+  #warn{position:fixed;top:12px;right:12px;background:#d32f2f;color:#fff;padding:8px 12px;border-radius:8px;display:none;z-index:9999}
+  #statusBar{position:fixed;left:12px;bottom:12px;background:#111;padding:8px 12px;border-radius:8px;font-size:13px;opacity:0.9}
+</style>
+</head>
+<body>
+
+<div id="warn">⚠️ Aktivitas Mencurigakan Terdeteksi</div>
+
+<!-- LOGIN / START -->
+<div class="login" id="loginBox">
+  <h2 style="margin:0 0 8px 0">Portal Ujian — Terawasi</h2>
+  <input id="stuName" placeholder="Nama lengkap (contoh: Budi Santoso)" />
+  <label style="font-size:13px;color:#bbb;margin-top:6px;display:block">
+    Pastikan kamera dan mikrofon dapat diizinkan saat diminta.
+  </label>
+  <button id="startBtn">Mulai Ujian (Buka Form)</button>
+</div>
+
+<!-- BEBERAPA UI -->
+<div id="frameWrap"><iframe id="formFrame" src=""></iframe></div>
+<div id="statusBar">Status: Menunggu</div>
+
+<script>
+/* ========== KONFIGURASI (GANTI INI) ========== */
+const FORM_EMBED_URL = "PASTE_FORM_EMBED_URL_HERE"; // contoh: https://docs.google.com/forms/d/e/FORM_ID/viewform?embedded=true
+const WEBAPP_URL = "PASTE_WEBAPP_URL_HERE"; // contoh: https://script.google.com/macros/s/....../exec
+const SNAPSHOT_INTERVAL_MS = 20000; // 20 detik
+const SAVE_SNAP = true; // true => kirim snapshot (jika server mendukung), false => tidak kirim snapshot
+/* ============================================ */
+
+let username = "";
+let videoStream = null;
+let snapshotTimer = null;
+let wakeLockObj = null;
+const statusBar = document.getElementById('statusBar');
+const warn = document.getElementById('warn');
+
+// helper: tampil pesan sementara
+function showWarn(text, ms=1800){
+  warn.textContent = "⚠️ " + text;
+  warn.style.display = "block";
+  setTimeout(()=> warn.style.display = "none", ms);
+}
+
+// helper: set status
+function setStatus(t){
+  statusBar.textContent = "Status: " + t;
+}
+
+/* ------------------ SEND LOG TO WEBAPP ------------------ */
+function sendLog(obj){
+  // siapkan payload
+  obj.user = username || "unknown";
+  obj.ts = new Date().toISOString();
+
+  // fetch - note: mode no-cors untuk menghindari restriction pada beberapa blog host
+  try {
+    fetch(WEBAPP_URL, {
+      method: 'POST',
+      mode: 'no-cors', // kita tidak butuh respon body, Google Script akan terima
+      headers: {'Content-Type':'application/json'},
+      body: JSON.stringify(obj)
+    });
+  } catch(e){
+    console.warn("sendLog error:", e);
+  }
+}
+
+/* ------------------ SNAPSHOT CAMERA ------------------ */
+async function startCameraSnapshots(){
+  if(!SAVE_SNAP) return;
+  try {
+    // minta izin kamera
+    videoStream = await navigator.mediaDevices.getUserMedia({video:true, audio:false});
+    setStatus("Kamera aktif");
+    // ambil snapshot berkala
+    snapshotTimer = setInterval(async ()=>{
+      try {
+        const track = videoStream.getVideoTracks()[0];
+        const imageCapture = new ImageCapture(track);
+        const bitmap = await imageCapture.grabFrame();
+        // buat canvas
+        const canvas = document.createElement('canvas');
+        canvas.width = Math.max(320, Math.min(bitmap.width, 640));
+        canvas.height = Math.round(canvas.width * bitmap.height / bitmap.width);
+        const ctx = canvas.getContext('2d');
+        ctx.drawImage(bitmap, 0, 0, canvas.width, canvas.height);
+        const dataUrl = canvas.toDataURL('image/jpeg', 0.6);
+        // kirim snapshot ke server
+        sendLog({event:'snapshot', snapshot: dataUrl});
+      } catch(err){
+        console.warn("snapshot error", err);
+      }
+    }, SNAPSHOT_INTERVAL_MS);
+  } catch(err){
+    console.warn("camera denied or error", err);
+    setStatus("Kamera tidak tersedia / ditolak");
+    sendLog({event:'camera_denied', details: String(err)});
+  }
+}
+
+// stop camera + timer
+function stopCameraSnapshots(){
+  if(snapshotTimer) { clearInterval(snapshotTimer); snapshotTimer = null; }
+  if(videoStream){
+    videoStream.getTracks().forEach(t => t.stop());
+    videoStream = null;
+  }
+}
+
+/* ------------------ WAKE LOCK (ANTI SCREEN OFF) ------------------ */
+async function requestWakeLock(){
+  if(!('wakeLock' in navigator)){
+    sendLog({event:'no_wakelock_support'});
+    return;
+  }
+  try {
+    wakeLockObj = await navigator.wakeLock.request('screen');
+    wakeLockObj.addEventListener('release', ()=>{
+      // dugaan layar mati / sleep
+      sendLog({event:'screen_off', details:{note:'wakeLock released'}});
+      showWarn("Layar terdeteksi mati / sleep!");
+      setStatus("WakeLock dilepas");
+    });
+    setStatus("WakeLock aktif");
+  } catch(err){
+    console.warn("wakelock failed", err);
+    sendLog({event:'wakelock_failed', details:String(err)});
+    setStatus("WakeLock gagal");
+  }
+}
+
+/* ------------------ MONITORING EVENTS ------------------ */
+function attachMonitors(){
+  // visibilitychange -> tab switch / backgrounding
+  document.addEventListener('visibilitychange', ()=>{
+    if(document.hidden){
+      sendLog({event:'visibility_hidden', violation:true});
+      showWarn("Keluar tab / berpindah aplikasi");
+      setStatus("Tab tersembunyi");
+    } else {
+      sendLog({event:'visibility_visible', violation:false});
+      setStatus("Kembali ke ujian");
+    }
+  });
+
+  // window blur/focus -> alt-tab atau pindah aplikasi
+  window.addEventListener('blur', ()=>{
+    sendLog({event:'window_blur', violation:true});
+    showWarn("Jendela hilang fokus");
+    setStatus("Blur");
+  });
+  window.addEventListener('focus', ()=>{
+    sendLog({event:'window_focus', violation:false});
+    setStatus("Focus");
+  });
+
+  // beforeunload -> reload / close
+  window.addEventListener('beforeunload', (e)=>{
+    navigator.sendBeacon && navigator.sendBeacon(WEBAPP_URL, JSON.stringify({user:username,event:'beforeunload'}));
+    sendLog({event:'beforeunload', violation:true});
+    // optional message not always shown
+    e.returnValue = "Anda akan meninggalkan halaman ujian!";
+  });
+
+  // block right-click / copy paste
+  document.addEventListener('contextmenu', (e)=>{ e.preventDefault(); sendLog({event:'contextmenu', violation:true}); showWarn("Klik kanan diblokir"); });
+  ['copy','cut','paste'].forEach(ev=>{
+    document.addEventListener(ev, (e)=>{ e.preventDefault(); sendLog({event:ev, violation:true}); showWarn(ev+" terdeteksi"); });
+  });
+
+  // prevent back button (mobile)
+  history.pushState(null, null, location.href);
+  window.addEventListener('popstate', function(event) {
+    history.pushState(null, null, location.href);
+    sendLog({event:'back_button', violation:true});
+    showWarn("Tombol kembali tidak diizinkan");
+  });
+}
+
+/* ------------------ START EXAM FLOW ------------------ */
+document.getElementById('startBtn').addEventListener('click', async ()=>{
+  const name = document.getElementById('stuName').value.trim();
+  if(!name){ alert("Mohon isi nama lengkap sebelum mulai."); return; }
+  username = name;
+  // hide login, show frame
+  document.getElementById('loginBox').style.display = 'none';
+  document.getElementById('frameWrap').style.display = 'block';
+  // set iframe src (Form)
+  document.getElementById('formFrame').src = FORM_EMBED_URL;
+  setStatus("Ujian dimulai");
+  sendLog({event:'start_exam'});
+  attachMonitors();
+  await startCameraSnapshots();
+  requestWakeLock();
+});
+
+/* ------------------ cleanup on unload (stop camera) ------------------ */
+window.addEventListener('unload', ()=>{
+  stopCameraSnapshots();
+  if(wakeLockObj) try{ wakeLockObj.release(); }catch(e){}
+});
+</script>
+
+</body>
+</html>
+<!-- ===== End of wrapper for Blogger ===== -->
